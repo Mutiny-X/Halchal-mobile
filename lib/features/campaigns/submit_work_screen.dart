@@ -148,17 +148,38 @@ class _SubmitWorkScreenState extends ConsumerState<SubmitWorkScreen>
   }
 
   static const _videoExtensions = {'mp4', 'mov', 'm4v', 'avi', 'mkv'};
+  // Matches the backend's actual enforced limits (creator-participation
+  // .controller.ts's upload-draft route, fileSize: 500 * 1024 * 1024 for
+  // video / the UI's own stated "20MB" for images) — checked here so an
+  // oversized file is rejected immediately instead of only after
+  // uploading the whole thing. Reported live: a ~976MB file spent 26+
+  // seconds uploading before the backend's 413 came back, and that 413
+  // isn't shaped like an ApiException, so it fell through to a generic
+  // "Upload failed. Please try again." with no indication of why.
+  static const _maxVideoBytes = 500 * 1024 * 1024;
+  static const _maxImageBytes = 20 * 1024 * 1024;
 
   Future<void> _pickAndUpload(FormatDeliverable d) async {
     final picker = ImagePicker();
     final file = await picker.pickMedia();
     if (file == null) return;
 
+    final ext = file.name.split('.').last.toLowerCase();
+    final isVideo = _videoExtensions.contains(ext);
+    final maxBytes = isVideo ? _maxVideoBytes : _maxImageBytes;
+    final sizeBytes = await file.length();
+    if (sizeBytes > maxBytes) {
+      final maxMb = maxBytes ~/ (1024 * 1024);
+      final actualMb = (sizeBytes / (1024 * 1024)).toStringAsFixed(0);
+      _showSnack(
+        '${isVideo ? "Video" : "Image"} is ${actualMb}MB — max is ${maxMb}MB.',
+      );
+      return;
+    }
+
     setState(() => _uploadingIds.add(d.id));
     try {
       final api = ref.read(apiClientProvider);
-      final ext = file.name.split('.').last.toLowerCase();
-      final isVideo = _videoExtensions.contains(ext);
       final mime = isVideo
           ? (ext == 'mov' ? 'video/quicktime' : 'video/mp4')
           : (ext == 'png' ? 'image/png' : 'image/jpeg');
@@ -190,6 +211,21 @@ class _SubmitWorkScreenState extends ConsumerState<SubmitWorkScreen>
     final vc = HalchalColors.of(context);
 
     return participation.when(
+      // participationSubmitProvider watches the app-wide realtime tick
+      // (see campaign_providers.dart), which bumps on ANY realtime event
+      // anywhere on the platform, unrelated to this submission. Riverpod
+      // treats that as a "reload" (skipLoadingOnReload defaults to
+      // false), so without this the loading branch below — a
+      // completely different VcScaffold subtree — replaced the whole
+      // screen on any such event, destroying _DeliverableSubmitCard's
+      // local _method state (which method — device upload vs. Drive
+      // link — is currently selected). Reported live: picking a file to
+      // upload from device, then having the screen revert to "Submit
+      // Google Drive link" selected once the upload finished, even
+      // though the file *had* uploaded successfully (that part lives in
+      // the parent's state, which survives — only the child's selected-
+      // method toggle was being lost).
+      skipLoadingOnReload: true,
       loading: () => const VcScaffold(
         title: 'Submit your work',
         showBack: true,
