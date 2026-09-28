@@ -536,6 +536,7 @@ class _PerformanceBodyState extends ConsumerState<_PerformanceBody> {
                   'Earnings are calculated per 1,000 eligible views',
                   'Make sure your reel remains public',
                   'Do not delete or archive the reel until payout is completed',
+                  'Payment is processed 30 days after the campaign closes',
                 ].map(
                   (note) => Padding(
                     padding: const EdgeInsets.only(bottom: 6),
