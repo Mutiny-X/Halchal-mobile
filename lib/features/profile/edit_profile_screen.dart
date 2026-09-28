@@ -91,7 +91,22 @@ class _EditProfileScreenState extends ConsumerState<EditProfileScreen> {
             displayName: _nameController.text.trim(),
             bio: _bioController.text.trim(),
           );
-      ref.invalidate(profileMeProvider);
+      // Awaited, not a fire-and-forget invalidate() — reported live: saving,
+      // then quickly reopening Edit Profile, showed the pre-save bio again
+      // (not the just-saved one) until a further refresh or round-trip.
+      // invalidate() only marks the provider stale; it doesn't wait for the
+      // refetch, so popping right after it could land back before the new
+      // value had actually loaded — and if the next Edit Profile screen's
+      // _initFrom happened to run against that still-stale cached value, its
+      // one-time-init guard would lock the fields onto it, never picking up
+      // the real value even once the refetch did resolve moments later.
+      // Awaiting the refetch here means the cache is guaranteed fresh by the
+      // time this screen pops, closing that whole race window.
+      // Awaited for the refetch to complete — the value itself isn't
+      // needed since ref.watch(profileMeProvider) elsewhere picks up the
+      // now-fresh cache on its own.
+      // ignore: unused_result
+      await ref.refresh(profileMeProvider.future);
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Profile updated')),
@@ -116,6 +131,20 @@ class _EditProfileScreenState extends ConsumerState<EditProfileScreen> {
       title: 'Edit Profile',
       showBack: true,
       body: me.when(
+        // profileMeProvider watches the app-wide realtime tick (see
+        // profile_providers.dart), which bumps on ANY realtime event
+        // anywhere in the app — another creator's deliverable getting
+        // reviewed, any brand publishing a campaign, etc., not just
+        // something about this user. Riverpod treats that as a "reload"
+        // (a watched dependency changed), not a "refresh" (invalidate) —
+        // skipLoadingOnRefresh defaults to true and would've been fine,
+        // but skipLoadingOnReload defaults to false, so without this the
+        // whole form (including whatever's currently in the bio field)
+        // got torn down to a bare spinner and rebuilt on literally any
+        // unrelated realtime event elsewhere on the platform, dropping
+        // the TextField's focus/keyboard mid-type. Reported live as "a
+        // glitch when updating bio" — it's this, not anything bio-specific.
+        skipLoadingOnReload: true,
         loading: () => const Center(child: CircularProgressIndicator()),
         error: (e, _) => RetryErrorView(
           message: '$e',
