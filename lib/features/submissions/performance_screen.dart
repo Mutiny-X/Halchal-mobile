@@ -326,12 +326,22 @@ class _PerformanceBodyState extends ConsumerState<_PerformanceBody> {
               children: [
                 Row(
                   children: [
-                    Text(
-                      'Estimated earnings',
-                      style: GoogleFonts.inter(
-                        fontSize: 14,
-                        fontWeight: FontWeight.w700,
-                        color: vc.onSurface,
+                    Flexible(
+                      // The rate pill and refresh button need to stay fully
+                      // visible/tappable — Spacer() only distributes leftover
+                      // space, it doesn't shrink anything when the row's
+                      // content is too wide to begin with, so without this
+                      // the pill (a fairly long string, e.g. "₹100.00 / 1K
+                      // views") pushed everything past the screen edge.
+                      child: Text(
+                        'Estimated earnings',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: GoogleFonts.inter(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w700,
+                          color: vc.onSurface,
+                        ),
                       ),
                     ),
                     const SizedBox(width: 6),
@@ -568,9 +578,12 @@ class _PerformanceBodyState extends ConsumerState<_PerformanceBody> {
             children: [
               Icon(Icons.lock_outline_rounded, size: 12, color: vc.muted),
               const SizedBox(width: 5),
-              Text(
-                'All earnings are estimated and subject to platform verification.',
-                style: GoogleFonts.inter(fontSize: 11, color: vc.muted),
+              Flexible(
+                child: Text(
+                  'All earnings are estimated and subject to platform verification.',
+                  textAlign: TextAlign.center,
+                  style: GoogleFonts.inter(fontSize: 11, color: vc.muted),
+                ),
               ),
             ],
           ),
