@@ -206,9 +206,14 @@ class _CampaignSummaryCard extends StatelessWidget {
             children: [
               ClipRRect(
                 borderRadius: BorderRadius.circular(16),
-                child: participation.campaign.brandLogoUrl != null
+                // coverImageUrl (the campaign's own creative — what
+                // campaign list/dashboard cards show), not brandLogoUrl
+                // (the brand's generic company logo) — this card is about
+                // the specific campaign the creator joined, not the brand
+                // as a whole.
+                child: participation.campaign.coverImageUrl != null
                     ? Image.network(
-                        participation.campaign.brandLogoUrl!,
+                        participation.campaign.coverImageUrl!,
                         width: 56,
                         height: 56,
                         fit: BoxFit.cover,
