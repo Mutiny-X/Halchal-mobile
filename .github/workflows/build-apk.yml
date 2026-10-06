@@ -8,7 +8,7 @@ on:
         required: false
         default: https://viralcut-api-production-6825.up.railway.app
   push:
-    branches: [main]
+    branches: [main, QA]
     paths:
       - lib/**
       - pubspec.yaml
@@ -26,7 +26,10 @@ jobs:
   build-android:
     runs-on: ubuntu-latest
     env:
-      API_BASE_URL: ${{ github.event.inputs.api_base_url || vars.API_BASE_URL || 'https://viralcut-api-production-6825.up.railway.app' }}
+      # Pushes to QA bake in the QA Railway API (repo variable QA_API_BASE_URL);
+      # everything else keeps the production default.
+      IS_QA: ${{ github.event_name == 'push' && github.ref_name == 'QA' }}
+      API_BASE_URL: ${{ (github.event_name == 'push' && github.ref_name == 'QA') && vars.QA_API_BASE_URL || github.event.inputs.api_base_url || vars.API_BASE_URL || 'https://viralcut-api-production-6825.up.railway.app' }}
       KEYSTORE_PATH: ${{ github.workspace }}/android/upload-keystore.p12
       STORE_PASSWORD: ${{ secrets.KEYSTORE_STORE_PASSWORD }}
       KEY_ALIAS: upload
@@ -35,6 +38,15 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Check QA API URL
+        if: env.IS_QA == 'true'
+        run: |
+          if [ -z "${{ vars.QA_API_BASE_URL }}" ]; then
+            echo "::error::Repo variable QA_API_BASE_URL is not set; refusing to build a QA APK against production."
+            exit 1
+          fi
+          echo "QA build -> $API_BASE_URL"
 
       - name: Set up Java
         uses: actions/setup-java@v4
@@ -63,16 +75,18 @@ jobs:
         run: flutter build apk --release --dart-define=API_BASE_URL=${{ env.API_BASE_URL }}
 
       - name: Build release AAB
+        if: env.IS_QA != 'true'
         run: flutter build appbundle --release --dart-define=API_BASE_URL=${{ env.API_BASE_URL }}
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: halchal-creator-apk-${{ github.run_number }}
+          name: halchal-creator-${{ env.IS_QA == 'true' && 'qa-' || '' }}apk-${{ github.run_number }}
           path: build/app/outputs/flutter-apk/app-release.apk
           retention-days: 30
 
       - name: Upload AAB artifact
+        if: env.IS_QA != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: halchal-creator-aab-${{ github.run_number }}
@@ -80,6 +94,8 @@ jobs:
           retention-days: 30
 
   build-ios:
+    # iOS is production-only; QA pushes build just the Android APK.
+    if: github.ref_name != 'QA'
     runs-on: macos-latest
     env:
       API_BASE_URL: ${{ github.event.inputs.api_base_url || vars.API_BASE_URL || 'https://viralcut-api-production-6825.up.railway.app' }}
