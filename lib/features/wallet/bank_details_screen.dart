@@ -11,6 +11,8 @@ import 'withdraw_screen.dart';
 
 final _ifscPattern = RegExp(r'^[A-Z]{4}0[A-Z0-9]{6}$');
 final _panPattern = RegExp(r'^[A-Z]{5}[0-9]{4}[A-Z]$');
+final _accountPattern = RegExp(r'^\d{6,20}$');
+final _upiPattern = RegExp(r'^[a-zA-Z0-9._-]{2,256}@[a-zA-Z0-9]{2,64}$');
 
 class BankDetailsScreen extends ConsumerStatefulWidget {
   const BankDetailsScreen({super.key});
@@ -23,6 +25,7 @@ class _BankDetailsScreenState extends ConsumerState<BankDetailsScreen> {
   final _formKey = GlobalKey<FormState>();
   final _nameCtrl = TextEditingController();
   final _accountCtrl = TextEditingController();
+  final _confirmAccountCtrl = TextEditingController();
   final _ifscCtrl = TextEditingController();
   final _bankNameCtrl = TextEditingController();
   final _panCtrl = TextEditingController();
@@ -42,7 +45,7 @@ class _BankDetailsScreenState extends ConsumerState<BankDetailsScreen> {
   @override
   void initState() {
     super.initState();
-    for (final c in [_nameCtrl, _accountCtrl, _ifscCtrl, _bankNameCtrl, _panCtrl, _upiCtrl]) {
+    for (final c in [_nameCtrl, _accountCtrl, _confirmAccountCtrl, _ifscCtrl, _bankNameCtrl, _panCtrl, _upiCtrl]) {
       c.addListener(_onChanged);
     }
     _loadExisting();
@@ -83,7 +86,7 @@ class _BankDetailsScreenState extends ConsumerState<BankDetailsScreen> {
 
   @override
   void dispose() {
-    for (final c in [_nameCtrl, _accountCtrl, _ifscCtrl, _bankNameCtrl, _panCtrl, _upiCtrl]) {
+    for (final c in [_nameCtrl, _accountCtrl, _confirmAccountCtrl, _ifscCtrl, _bankNameCtrl, _panCtrl, _upiCtrl]) {
       c.dispose();
     }
     super.dispose();
@@ -148,6 +151,7 @@ class _BankDetailsScreenState extends ConsumerState<BankDetailsScreen> {
       if (!mounted) return;
       _nameCtrl.clear();
       _accountCtrl.clear();
+      _confirmAccountCtrl.clear();
       _ifscCtrl.clear();
       _bankNameCtrl.clear();
       _panCtrl.clear();
@@ -293,8 +297,9 @@ class _BankDetailsScreenState extends ConsumerState<BankDetailsScreen> {
                             placeholder: 'Bank account number',
                             keyboardType: TextInputType.number,
                             inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-                            validator: (v) =>
-                                (v == null || v.trim().length < 6) ? 'Required' : null,
+                            validator: (v) => _accountPattern.hasMatch(v?.trim() ?? '')
+                                ? null
+                                : 'Enter your account number (6-20 digits)',
                           )
                         else
                           _ReadOnlyRow(
@@ -318,6 +323,21 @@ class _BankDetailsScreenState extends ConsumerState<BankDetailsScreen> {
                                     onPressed: _toggleRevealed,
                                     tooltip: _revealed ? 'Hide account number' : 'Show account number',
                                   ),
+                          ),
+                        // Typing an account number twice catches the typo that
+                        // would otherwise send a payment to the wrong account.
+                        if (_existingBank == null)
+                          _FormRow(
+                            icon: Icons.tag_rounded,
+                            label: 'Confirm A/c No.',
+                            required: true,
+                            controller: _confirmAccountCtrl,
+                            placeholder: 'Re-enter account number',
+                            keyboardType: TextInputType.number,
+                            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                            validator: (v) => (v?.trim() ?? '') == _accountCtrl.text.trim()
+                                ? null
+                                : 'Account numbers do not match',
                           ),
                         _FormRow(
                           icon: Icons.account_balance_outlined,
@@ -367,6 +387,15 @@ class _BankDetailsScreenState extends ConsumerState<BankDetailsScreen> {
                               ? _existingUpi!.accountMasked
                               : 'e.g. name@upi (optional)',
                           isLast: true,
+                          // Only checked for a new UPI ID - an existing one is
+                          // shown masked and isn't editable here.
+                          validator: _existingUpi != null
+                              ? null
+                              : (v) {
+                                  final s = v?.trim() ?? '';
+                                  if (s.isEmpty) return null;
+                                  return _upiPattern.hasMatch(s) ? null : 'Enter a valid UPI ID (name@bank)';
+                                },
                         ),
                         if (_existingBank != null)
                           Padding(

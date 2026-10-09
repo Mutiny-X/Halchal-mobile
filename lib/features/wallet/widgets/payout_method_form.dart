@@ -10,6 +10,9 @@ import '../../../theme/halchal_colors.dart';
 import 'bank_card_preview.dart';
 
 final _ifscPattern = RegExp(r'^[A-Z]{4}0[A-Z0-9]{6}$');
+final _panPattern = RegExp(r'^[A-Z]{5}[0-9]{4}[A-Z]$');
+final _accountPattern = RegExp(r'^\d{6,20}$');
+final _upiPattern = RegExp(r'^[a-zA-Z0-9._-]{2,256}@[a-zA-Z0-9]{2,64}$');
 
 /// Bank/UPI details capture form, shared by the payout methods bottom sheet
 /// and the inline "add a payout method" flow on the withdraw screen.
@@ -33,7 +36,9 @@ class _PayoutMethodFormState extends ConsumerState<PayoutMethodForm> {
   final _labelController = TextEditingController();
   final _holderController = TextEditingController();
   final _accountController = TextEditingController();
+  final _confirmAccountController = TextEditingController();
   final _ifscController = TextEditingController();
+  final _panController = TextEditingController();
   bool _saving = false;
   bool _revealed = false;
 
@@ -54,7 +59,9 @@ class _PayoutMethodFormState extends ConsumerState<PayoutMethodForm> {
     _labelController.dispose();
     _holderController.dispose();
     _accountController.dispose();
+    _confirmAccountController.dispose();
     _ifscController.dispose();
+    _panController.dispose();
     super.dispose();
   }
 
@@ -69,6 +76,12 @@ class _PayoutMethodFormState extends ConsumerState<PayoutMethodForm> {
             account: _accountController.text.trim(),
             ifscCode: _type == 'bank'
                 ? _ifscController.text.trim().toUpperCase()
+                : null,
+            // The API requires a PAN for bank accounts (used for tax reporting
+            // on payouts); this form used to omit it, so adding a bank here
+            // was always rejected.
+            panNumber: _type == 'bank'
+                ? _panController.text.trim().toUpperCase()
                 : null,
           );
       if (!mounted) return;
@@ -179,13 +192,44 @@ class _PayoutMethodFormState extends ConsumerState<PayoutMethodForm> {
               border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
             ),
             validator: (v) {
-              if (v == null || v.trim().length < 4) {
-                return _type == 'upi' ? 'Enter a valid UPI ID' : 'Enter your account number';
+              final s = v?.trim() ?? '';
+              if (_type == 'upi') {
+                return _upiPattern.hasMatch(s) ? null : 'Enter a valid UPI ID (name@bank)';
               }
-              return null;
+              return _accountPattern.hasMatch(s) ? null : 'Enter your account number (6-20 digits)';
             },
           ),
           if (_type == 'bank') ...[
+            const SizedBox(height: 12),
+            TextFormField(
+              controller: _confirmAccountController,
+              keyboardType: TextInputType.number,
+              inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+              decoration: InputDecoration(
+                labelText: 'Confirm account number',
+                hintText: 'Re-enter account number',
+                filled: true,
+                fillColor: vc.surface,
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+              ),
+              validator: (v) => (v?.trim() ?? '') == _accountController.text.trim()
+                  ? null
+                  : 'Account numbers do not match',
+            ),
+            const SizedBox(height: 12),
+            TextFormField(
+              controller: _panController,
+              textCapitalization: TextCapitalization.characters,
+              inputFormatters: [UpperCaseTextInputFormatter()],
+              decoration: InputDecoration(
+                labelText: 'PAN',
+                hintText: 'ABCPV1234D',
+                filled: true,
+                fillColor: vc.surface,
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+              ),
+              validator: (v) => _panPattern.hasMatch(v?.trim() ?? '') ? null : 'Enter a valid PAN',
+            ),
             const SizedBox(height: 12),
             TextFormField(
               controller: _ifscController,

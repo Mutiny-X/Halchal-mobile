@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:google_fonts/google_fonts.dart';
@@ -12,17 +11,11 @@ import '../../core/widgets/retry_error_view.dart';
 import '../../core/widgets/vc_scaffold.dart';
 import '../../theme/halchal_colors.dart';
 import 'wallet_providers.dart';
+import 'withdrawal_state.dart';
 
 final payoutMethodsProvider = FutureProvider<List<PayoutMethod>>((ref) async {
   return ref.read(apiClientProvider).fetchPayoutMethods();
 });
-
-/// Payouts are being run manually for now, not through this in-app flow —
-/// flip back to false once that changes. Locking here (the destination
-/// page) rather than only disabling the buttons that link here means every
-/// entry point (dashboard card, wallet tab, a direct deep link) is
-/// consistently locked regardless of which one was tapped.
-const bool _withdrawalsLocked = true;
 
 class WithdrawScreen extends ConsumerStatefulWidget {
   const WithdrawScreen({super.key});
@@ -32,51 +25,61 @@ class WithdrawScreen extends ConsumerStatefulWidget {
 }
 
 class _WithdrawScreenState extends ConsumerState<WithdrawScreen> {
-  final _amountController = TextEditingController();
+  int? _amountPaise;
   String? _methodId;
   bool _loading = false;
 
-  int get _amountPaise => (int.tryParse(_amountController.text) ?? 0) * 100;
-  int get _feePaise => (_amountPaise * 500 ~/ 10000);
-  int get _netPaise => _amountPaise - _feePaise;
+  /// One key per withdrawal attempt, reused if the same request is retried
+  /// (e.g. the connection dropped after the server saved it) so a retry can
+  /// never create a second withdrawal. Cleared when the creator changes the
+  /// amount or method, and after a success.
+  String? _attemptKey;
 
-  @override
-  void dispose() {
-    _amountController.dispose();
-    super.dispose();
+  void _pickAmount(int amountPaise) {
+    setState(() {
+      _amountPaise = amountPaise;
+      _attemptKey = null;
+    });
   }
 
-  void _addAmount(int rupees) {
-    final current = int.tryParse(_amountController.text) ?? 0;
-    _amountController.text = '${current + rupees}';
-    setState(() {});
+  void _pickMethod(String id) {
+    setState(() {
+      _methodId = id;
+      _attemptKey = null;
+    });
   }
 
-  Future<void> _submit(List<PayoutMethod> methods) async {
-    if (_methodId == null || _amountPaise <= 0) return;
+  Future<void> _submit(WithdrawalRules rules) async {
+    final amount = _amountPaise;
+    final methodId = _methodId;
+    if (amount == null || methodId == null) return;
     setState(() => _loading = true);
+    _attemptKey ??= 'wd-${DateTime.now().microsecondsSinceEpoch}-$amount-$methodId';
     try {
       final result = await ref.read(apiClientProvider).createWithdrawal(
-            amountPaise: _amountPaise,
-            payoutMethodId: _methodId!,
-            idempotencyKey: 'wd-${DateTime.now().millisecondsSinceEpoch}',
+            amountPaise: amount,
+            payoutMethodId: methodId,
+            idempotencyKey: _attemptKey,
           );
+      _attemptKey = null;
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            'You receive ${formatPaise(result.netPaise)} (fee ${formatPaise(result.feePaise)})',
+            'Withdrawal requested — ${formatPaise(result.netPaise)} will reach you within ${rules.expectedDays} days.',
           ),
         ),
       );
       ref.invalidate(walletProvider);
       ref.invalidate(walletTransactionsProvider);
+      ref.invalidate(withdrawalsProvider);
       context.pop();
     } on ApiException catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(e.message)),
-      );
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.message)));
+      // The rules may have changed under us (e.g. a request already open) —
+      // refresh so the screen explains why instead of just failing again.
+      ref.invalidate(walletProvider);
     } finally {
       if (mounted) setState(() => _loading = false);
     }
@@ -84,352 +87,375 @@ class _WithdrawScreenState extends ConsumerState<WithdrawScreen> {
 
   @override
   Widget build(BuildContext context) {
-    if (_withdrawalsLocked) {
-      return const _WithdrawLockedView();
-    }
-
     final wallet = ref.watch(walletProvider);
     final methods = ref.watch(payoutMethodsProvider);
-    final vc = HalchalColors.of(context);
-    final primary = Theme.of(context).colorScheme.primary;
 
     return VcScaffold(
       title: 'Withdraw',
       showBack: true,
-      body: methods.when(
+      body: wallet.when(
+        skipLoadingOnRefresh: true,
         loading: () => const Center(child: CircularProgressIndicator()),
         error: (e, _) => RetryErrorView(
           message: '$e',
-          onRetry: () => ref.invalidate(payoutMethodsProvider),
+          onRetry: () => ref.invalidate(walletProvider),
         ),
-        data: (list) {
-          if (list.isNotEmpty && _methodId == null) {
-            WidgetsBinding.instance.addPostFrameCallback(
-              (_) => setState(() => _methodId = list.first.id),
-            );
-          }
+        data: (w) => methods.when(
+          loading: () => const Center(child: CircularProgressIndicator()),
+          error: (e, _) => RetryErrorView(
+            message: '$e',
+            onRetry: () => ref.invalidate(payoutMethodsProvider),
+          ),
+          data: (list) => _buildBody(context, w, list),
+        ),
+      ),
+    );
+  }
 
-          final availablePaise = wallet.valueOrNull?.availablePaise ?? 0;
+  Widget _buildBody(BuildContext context, WalletData w, List<PayoutMethod> list) {
+    final vc = HalchalColors.of(context);
+    final primary = Theme.of(context).colorScheme.primary;
+    final rules = w.withdrawal;
+    final availability = withdrawalAvailability(rules);
 
-          return SingleChildScrollView(
-            padding: const EdgeInsets.fromLTRB(
-              AppSpacing.screenHorizontal,
-              AppSpacing.sm,
-              AppSpacing.screenHorizontal,
-              AppSpacing.xl,
+    if (list.isNotEmpty && _methodId == null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _methodId == null) setState(() => _methodId = list.first.id);
+      });
+    }
+
+    final amount = _amountPaise;
+    // An amount picked earlier may no longer be valid (balance changed).
+    final amountStillValid = amount != null &&
+        rules.denominationsPaise.contains(amount) &&
+        amount <= w.availablePaise;
+
+    return SingleChildScrollView(
+      padding: const EdgeInsets.fromLTRB(
+        AppSpacing.screenHorizontal,
+        AppSpacing.sm,
+        AppSpacing.screenHorizontal,
+        AppSpacing.xl,
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Balance card
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(20),
+            decoration: BoxDecoration(
+              color: vc.deepSurface,
+              borderRadius: BorderRadius.circular(20),
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                // Balance card
-                Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.all(20),
-                  decoration: BoxDecoration(
-                    color: vc.deepSurface,
-                    borderRadius: BorderRadius.circular(20),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        'Available balance',
-                        style: GoogleFonts.inter(
-                          fontSize: 12,
-                          color: Colors.white60,
-                        ),
-                      ),
-                      const SizedBox(height: 6),
-                      Text(
-                        formatPaise(availablePaise),
-                        style: GoogleFonts.plusJakartaSans(
-                          fontSize: 32,
-                          fontWeight: FontWeight.w800,
-                          color: vc.moneyBright,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 24),
-
-                // Amount input
                 Text(
-                  'ENTER AMOUNT',
-                  style: GoogleFonts.inter(
-                    fontSize: 11,
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: 0.8,
-                    color: vc.muted,
-                  ),
+                  'Available balance',
+                  style: GoogleFonts.inter(fontSize: 12, color: Colors.white60),
                 ),
-                const SizedBox(height: 10),
-                TextField(
-                  controller: _amountController,
-                  keyboardType: TextInputType.number,
-                  inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-                  onChanged: (_) => setState(() {}),
+                const SizedBox(height: 6),
+                Text(
+                  formatPaise(w.availablePaise),
                   style: GoogleFonts.plusJakartaSans(
-                    fontSize: 22,
-                    fontWeight: FontWeight.w700,
-                    color: vc.onSurface,
-                  ),
-                  decoration: InputDecoration(
-                    prefixText: '₹ ',
-                    prefixStyle: GoogleFonts.plusJakartaSans(
-                      fontSize: 22,
-                      fontWeight: FontWeight.w700,
-                      color: vc.muted,
-                    ),
-                    hintText: '0',
-                    hintStyle: GoogleFonts.plusJakartaSans(
-                      fontSize: 22,
-                      fontWeight: FontWeight.w700,
-                      color: vc.border,
-                    ),
-                    filled: true,
-                    fillColor: vc.surface,
-                    contentPadding: const EdgeInsets.symmetric(
-                      horizontal: 16,
-                      vertical: 16,
-                    ),
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(14),
-                      borderSide: BorderSide(color: vc.border),
-                    ),
-                    enabledBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(14),
-                      borderSide: BorderSide(color: vc.border),
-                    ),
-                    focusedBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(14),
-                      borderSide: BorderSide(color: primary, width: 1.5),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 12),
-
-                // Quick-add chips
-                Wrap(
-                  spacing: 8,
-                  children: [1000, 5000, 10000, 20000].map((r) {
-                    return ActionChip(
-                      label: Text('+₹${r ~/ 1}'),
-                      onPressed: () => _addAmount(r),
-                      backgroundColor: vc.surface,
-                      side: BorderSide(color: vc.border),
-                      labelStyle: GoogleFonts.inter(
-                        fontSize: 13,
-                        fontWeight: FontWeight.w600,
-                        color: vc.onSurface,
-                      ),
-                    );
-                  }).toList(),
-                ),
-                const SizedBox(height: 24),
-
-                if (list.isNotEmpty) ...[
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Text(
-                        'WITHDRAW TO',
-                        style: GoogleFonts.inter(
-                          fontSize: 11,
-                          fontWeight: FontWeight.w700,
-                          letterSpacing: 0.8,
-                          color: vc.muted,
-                        ),
-                      ),
-                      GestureDetector(
-                        onTap: () => context
-                            .push('/wallet/bank-details')
-                            .then((_) => ref.invalidate(payoutMethodsProvider)),
-                        child: Text(
-                          'Manage',
-                          style: GoogleFonts.inter(
-                            fontSize: 12,
-                            fontWeight: FontWeight.w600,
-                            color: primary,
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 10),
-                  ...list.map((m) => _PayoutMethodTile(
-                        method: m,
-                        selected: _methodId == m.id,
-                        onTap: () => setState(() => _methodId = m.id),
-                      )),
-                ] else ...[
-                  Container(
-                    padding: const EdgeInsets.all(20),
-                    decoration: BoxDecoration(
-                      color: vc.surface,
-                      borderRadius: BorderRadius.circular(14),
-                      border: Border.all(color: vc.border),
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Row(
-                          children: [
-                            Icon(Icons.account_balance_outlined, color: vc.primary, size: 20),
-                            const SizedBox(width: 10),
-                            Text(
-                              'Add your bank details',
-                              style: GoogleFonts.plusJakartaSans(
-                                fontSize: 15,
-                                fontWeight: FontWeight.w700,
-                                color: vc.onSurface,
-                              ),
-                            ),
-                          ],
-                        ),
-                        const SizedBox(height: 8),
-                        Text(
-                          'Money can only be withdrawn to a bank account — add yours (with PAN) to continue.',
-                          style: GoogleFonts.inter(fontSize: 13, height: 1.4, color: vc.muted),
-                        ),
-                        const SizedBox(height: 14),
-                        SizedBox(
-                          width: double.infinity,
-                          child: OutlinedButton(
-                            onPressed: () => context
-                                .push('/wallet/bank-details')
-                                .then((_) => ref.invalidate(payoutMethodsProvider)),
-                            style: OutlinedButton.styleFrom(
-                              padding: const EdgeInsets.symmetric(vertical: 12),
-                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                            ),
-                            child: const Text('Add bank details'),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
-                const SizedBox(height: 24),
-
-                if (_amountPaise > 0) ...[
-                  _SummaryTable(
-                    amountPaise: _amountPaise,
-                    feePaise: _feePaise,
-                    netPaise: _netPaise,
-                  ),
-                  const SizedBox(height: 20),
-                ],
-
-                SizedBox(
-                  width: double.infinity,
-                  child: FilledButton(
-                    onPressed: _loading || _methodId == null || _amountPaise <= 0
-                        ? null
-                        : () => _submit(list),
-                    style: FilledButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(vertical: 16),
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(14),
-                      ),
-                      elevation: 0,
-                    ),
-                    child: _loading
-                        ? const SizedBox(
-                            width: 22,
-                            height: 22,
-                            child: CircularProgressIndicator(
-                              strokeWidth: 2,
-                              color: Colors.white,
-                            ),
-                          )
-                        : Text(
-                            'Withdraw Now',
-                            style: GoogleFonts.inter(
-                              fontSize: 16,
-                              fontWeight: FontWeight.w700,
-                            ),
-                          ),
+                    fontSize: 32,
+                    fontWeight: FontWeight.w800,
+                    color: vc.moneyBright,
                   ),
                 ),
               ],
             ),
-          );
-        },
+          ),
+          const SizedBox(height: 24),
+
+          if (!availability.canWithdraw) ...[
+            _NoticeCard(
+              key: const Key('withdraw-notice'),
+              block: availability.block,
+              message: availability.message,
+              lifetimePaise: w.lifetimePaise,
+              gatePaise: rules.lifetimeGatePaise,
+            ),
+            if (availability.block == WithdrawalBlock.openRequest ||
+                availability.block == WithdrawalBlock.dailyLimit) ...[
+              const SizedBox(height: 12),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton(
+                  onPressed: () => context.go('/wallet'),
+                  style: OutlinedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                  ),
+                  child: const Text('See my withdrawals'),
+                ),
+              ),
+            ],
+          ] else ...[
+            // Amount picker — fixed amounts only, no free typing.
+            Text(
+              'CHOOSE AMOUNT',
+              style: GoogleFonts.inter(
+                fontSize: 11,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 0.8,
+                color: vc.muted,
+              ),
+            ),
+            const SizedBox(height: 10),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                for (final o in withdrawalOptions(rules, w.availablePaise))
+                  ChoiceChip(
+                    key: Key('amount-${o.amountPaise}'),
+                    label: Text(formatPaise(o.amountPaise)),
+                    selected: amountStillValid && amount == o.amountPaise,
+                    onSelected: o.affordable ? (_) => _pickAmount(o.amountPaise) : null,
+                    labelStyle: GoogleFonts.inter(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                      color: o.affordable ? vc.onSurface : vc.muted.withValues(alpha: 0.5),
+                    ),
+                    backgroundColor: vc.surface,
+                    side: BorderSide(color: vc.border),
+                  ),
+              ],
+            ),
+            if (!withdrawalOptions(rules, w.availablePaise).any((o) => o.affordable)) ...[
+              const SizedBox(height: 10),
+              Text(
+                'Your available balance is below the smallest withdrawal '
+                '(${formatPaise(rules.denominationsPaise.first)}).',
+                key: const Key('below-minimum'),
+                style: GoogleFonts.inter(fontSize: 12, height: 1.4, color: vc.muted),
+              ),
+            ],
+            const SizedBox(height: 24),
+
+            if (list.isNotEmpty) ...[
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(
+                    'PAY TO',
+                    style: GoogleFonts.inter(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 0.8,
+                      color: vc.muted,
+                    ),
+                  ),
+                  GestureDetector(
+                    onTap: () => context
+                        .push('/wallet/bank-details')
+                        .then((_) => ref.invalidate(payoutMethodsProvider)),
+                    child: Text(
+                      'Manage',
+                      style: GoogleFonts.inter(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: primary,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              ...list.map((m) => _PayoutMethodTile(
+                    method: m,
+                    selected: _methodId == m.id,
+                    onTap: () => _pickMethod(m.id),
+                  )),
+            ] else ...[
+              Container(
+                padding: const EdgeInsets.all(20),
+                decoration: BoxDecoration(
+                  color: vc.surface,
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(color: vc.border),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Icon(Icons.account_balance_outlined, color: vc.primary, size: 20),
+                        const SizedBox(width: 10),
+                        Text(
+                          'Add your bank details',
+                          style: GoogleFonts.plusJakartaSans(
+                            fontSize: 15,
+                            fontWeight: FontWeight.w700,
+                            color: vc.onSurface,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'Money can only be withdrawn to a bank account — add yours (with PAN) to continue.',
+                      style: GoogleFonts.inter(fontSize: 13, height: 1.4, color: vc.muted),
+                    ),
+                    const SizedBox(height: 14),
+                    SizedBox(
+                      width: double.infinity,
+                      child: OutlinedButton(
+                        onPressed: () => context
+                            .push('/wallet/bank-details')
+                            .then((_) => ref.invalidate(payoutMethodsProvider)),
+                        style: OutlinedButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(vertical: 12),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                        ),
+                        child: const Text('Add bank details'),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+            const SizedBox(height: 24),
+
+            if (amountStillValid) ...[
+              _SummaryTable(
+                amountPaise: amount,
+                feePaise: rules.feeFor(amount),
+                netPaise: rules.netFor(amount),
+                feeLabel: _feeLabel(rules.feeBps),
+              ),
+              const SizedBox(height: 10),
+              Text(
+                'Paid to your account within ${rules.expectedDays} days of your request. '
+                'If a payment can\'t be made, the full amount returns to your wallet.',
+                key: const Key('payment-timeline'),
+                style: GoogleFonts.inter(fontSize: 12, height: 1.4, color: vc.muted),
+              ),
+              const SizedBox(height: 20),
+            ],
+
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton(
+                key: const Key('request-withdrawal'),
+                onPressed: _loading || _methodId == null || !amountStillValid
+                    ? null
+                    : () => _submit(rules),
+                style: FilledButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(vertical: 16),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                  elevation: 0,
+                ),
+                child: _loading
+                    ? const SizedBox(
+                        width: 22,
+                        height: 22,
+                        child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                      )
+                    : Text(
+                        'Request withdrawal',
+                        style: GoogleFonts.inter(fontSize: 16, fontWeight: FontWeight.w700),
+                      ),
+              ),
+            ),
+          ],
+        ],
       ),
     );
   }
 }
 
-class _WithdrawLockedView extends ConsumerWidget {
-  const _WithdrawLockedView();
+/// "5%" for 500 bps, "1.5%" for 150 bps.
+String _feeLabel(int feeBps) {
+  final pct = feeBps / 100;
+  final text = pct == pct.roundToDouble() ? pct.toStringAsFixed(0) : pct.toStringAsFixed(1);
+  return 'Platform fee ($text%)';
+}
+
+/// Explains why withdrawing isn't possible right now, with a progress bar
+/// towards the unlock threshold when that's the reason.
+class _NoticeCard extends StatelessWidget {
+  const _NoticeCard({
+    super.key,
+    required this.block,
+    required this.message,
+    required this.lifetimePaise,
+    required this.gatePaise,
+  });
+
+  final WithdrawalBlock block;
+  final String message;
+  final int lifetimePaise;
+  final int gatePaise;
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final wallet = ref.watch(walletProvider);
+  Widget build(BuildContext context) {
     final vc = HalchalColors.of(context);
+    final icon = switch (block) {
+      WithdrawalBlock.locked => Icons.lock_outline_rounded,
+      WithdrawalBlock.openRequest => Icons.hourglass_top_rounded,
+      WithdrawalBlock.dailyLimit => Icons.event_available_outlined,
+      _ => Icons.info_outline_rounded,
+    };
+    final title = switch (block) {
+      WithdrawalBlock.locked => 'Withdrawals are locked',
+      WithdrawalBlock.openRequest => 'Withdrawal in progress',
+      WithdrawalBlock.dailyLimit => 'One withdrawal per day',
+      _ => 'Withdrawals unavailable',
+    };
+    final progress = gatePaise > 0 ? (lifetimePaise / gatePaise).clamp(0.0, 1.0) : 0.0;
 
-    return VcScaffold(
-      title: 'Withdraw',
-      showBack: true,
-      body: Padding(
-        padding: const EdgeInsets.all(28),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Container(
-              width: 72,
-              height: 72,
-              decoration: BoxDecoration(
-                color: vc.primary.withValues(alpha: 0.12),
-                shape: BoxShape.circle,
-              ),
-              child: Icon(Icons.lock_outline_rounded, color: vc.primary, size: 32),
-            ),
-            const SizedBox(height: 24),
-            Text(
-              'Payouts are handled manually',
-              textAlign: TextAlign.center,
-              style: GoogleFonts.plusJakartaSans(
-                fontSize: 20,
-                fontWeight: FontWeight.w800,
-                color: vc.onSurface,
-              ),
-            ),
-            const SizedBox(height: 10),
-            Text(
-              'We\'re currently processing payouts manually rather than through in-app withdrawal. Your earnings are safe and tracked — we\'ll reach out when it\'s time to pay out.',
-              textAlign: TextAlign.center,
-              style: GoogleFonts.inter(fontSize: 13, height: 1.5, color: vc.muted),
-            ),
-            const SizedBox(height: 24),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
-              decoration: BoxDecoration(
-                color: vc.surface,
-                borderRadius: BorderRadius.circular(14),
-                border: Border.all(color: vc.border),
-              ),
-              child: Column(
-                children: [
-                  Text(
-                    'Total earned',
-                    style: GoogleFonts.inter(fontSize: 12, color: vc.muted),
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: vc.surface,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: vc.border),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(icon, color: vc.primary, size: 20),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  title,
+                  style: GoogleFonts.plusJakartaSans(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w700,
+                    color: vc.onSurface,
                   ),
-                  const SizedBox(height: 4),
-                  Text(
-                    formatPaise(wallet.valueOrNull?.lifetimePaise ?? 0),
-                    style: GoogleFonts.plusJakartaSans(
-                      fontSize: 22,
-                      fontWeight: FontWeight.w800,
-                      color: vc.moneyBright,
-                    ),
-                  ),
-                ],
+                ),
               ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            message,
+            style: GoogleFonts.inter(fontSize: 13, height: 1.4, color: vc.muted),
+          ),
+          if (block == WithdrawalBlock.locked && gatePaise > 0) ...[
+            const SizedBox(height: 14),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(6),
+              child: LinearProgressIndicator(
+                value: progress,
+                minHeight: 8,
+                backgroundColor: vc.border,
+              ),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              '${formatPaise(lifetimePaise)} of ${formatPaise(gatePaise)} earned',
+              style: GoogleFonts.inter(fontSize: 11, color: vc.muted),
             ),
           ],
-        ),
+        ],
       ),
     );
   }
@@ -467,7 +493,7 @@ class _PayoutMethodTile extends StatelessWidget {
         child: Row(
           children: [
             Icon(
-              method.label.toLowerCase().contains('upi')
+              method.type == 'upi' || method.label.toLowerCase().contains('upi')
                   ? Icons.phone_android
                   : Icons.account_balance,
               size: 20,
@@ -488,16 +514,12 @@ class _PayoutMethodTile extends StatelessWidget {
                   ),
                   Text(
                     method.accountMasked,
-                    style: GoogleFonts.inter(
-                      fontSize: 12,
-                      color: vc.muted,
-                    ),
+                    style: GoogleFonts.inter(fontSize: 12, color: vc.muted),
                   ),
                 ],
               ),
             ),
-            if (selected)
-              Icon(Icons.check_circle_rounded, color: primary, size: 20),
+            if (selected) Icon(Icons.check_circle_rounded, color: primary, size: 20),
           ],
         ),
       ),
@@ -510,11 +532,13 @@ class _SummaryTable extends StatelessWidget {
     required this.amountPaise,
     required this.feePaise,
     required this.netPaise,
+    required this.feeLabel,
   });
 
   final int amountPaise;
   final int feePaise;
   final int netPaise;
+  final String feeLabel;
 
   @override
   Widget build(BuildContext context) {
@@ -531,7 +555,7 @@ class _SummaryTable extends StatelessWidget {
           _Row(label: 'Amount', value: formatPaise(amountPaise), vc: vc),
           const SizedBox(height: 8),
           _Row(
-            label: 'Platform fee (5%)',
+            label: feeLabel,
             value: '- ${formatPaise(feePaise)}',
             vc: vc,
             valueColor: vc.muted,
@@ -573,13 +597,7 @@ class _Row extends StatelessWidget {
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
-        Text(
-          label,
-          style: GoogleFonts.inter(
-            fontSize: 13,
-            color: vc.muted,
-          ),
-        ),
+        Text(label, style: GoogleFonts.inter(fontSize: 13, color: vc.muted)),
         Text(
           value,
           style: GoogleFonts.inter(
