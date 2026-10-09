@@ -5,6 +5,7 @@ import 'package:google_fonts/google_fonts.dart';
 import '../../../core/api/api_client.dart';
 import '../../../core/format/money_format.dart';
 import '../../../theme/halchal_colors.dart';
+import '../../wallet/withdrawal_state.dart';
 
 class DashboardEarningsCard extends StatelessWidget {
   const DashboardEarningsCard({
@@ -100,7 +101,11 @@ class DashboardEarningsCard extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 12),
-          _WithdrawButton(onPressed: onWithdraw, onDark: onDark),
+          _WithdrawButton(
+            onPressed: onWithdraw,
+            onDark: onDark,
+            rules: wallet.withdrawal,
+          ),
         ],
       ),
     );
@@ -174,23 +179,29 @@ class _MetricTile extends StatelessWidget {
 }
 
 class _WithdrawButton extends StatelessWidget {
-  const _WithdrawButton({required this.onPressed, required this.onDark});
+  const _WithdrawButton({
+    required this.onPressed,
+    required this.onDark,
+    required this.rules,
+  });
 
   final VoidCallback onPressed;
   final Color onDark;
+  final WithdrawalRules rules;
 
   @override
   Widget build(BuildContext context) {
+    final availability = withdrawalAvailability(rules);
+    final canWithdraw = availability.canWithdraw;
     return Material(
       color: onDark.withValues(alpha: 0.08),
       borderRadius: BorderRadius.circular(14),
+      // Always opens the Withdraw screen: it explains any block in full.
       child: InkWell(
-        onTap: () => ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Payouts are being processed manually for now')),
-        ),
+        onTap: onPressed,
         borderRadius: BorderRadius.circular(14),
         child: Opacity(
-          opacity: 0.55,
+          opacity: canWithdraw ? 1 : 0.7,
           child: Container(
             constraints: const BoxConstraints(minHeight: 44),
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
@@ -212,7 +223,7 @@ class _WithdrawButton extends StatelessWidget {
                       ),
                       const SizedBox(height: 2),
                       Text(
-                        'Processed manually for now',
+                        withdrawSubtitle(rules),
                         style: GoogleFonts.inter(
                           color: onDark.withValues(alpha: 0.62),
                           fontSize: 11,
@@ -222,7 +233,13 @@ class _WithdrawButton extends StatelessWidget {
                     ],
                   ),
                 ),
-                Icon(Icons.lock_outline_rounded, color: onDark, size: 18),
+                Icon(
+                  availability.block == WithdrawalBlock.locked
+                      ? Icons.lock_outline_rounded
+                      : Icons.arrow_forward_rounded,
+                  color: onDark,
+                  size: 18,
+                ),
               ],
             ),
           ),

@@ -10,6 +10,7 @@ import '../../core/layout/list_entrance.dart';
 import '../../core/widgets/retry_error_view.dart';
 import '../../theme/halchal_colors.dart';
 import 'wallet_providers.dart';
+import 'withdrawal_state.dart';
 
 class WalletScreen extends ConsumerWidget {
   const WalletScreen({super.key});
@@ -18,6 +19,7 @@ class WalletScreen extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final wallet = ref.watch(walletProvider);
     final transactions = ref.watch(walletTransactionsProvider);
+    final withdrawals = ref.watch(withdrawalsProvider);
 
     return wallet.when(
       skipLoadingOnRefresh: true,
@@ -27,6 +29,7 @@ class WalletScreen extends ConsumerWidget {
         onRetry: () {
           ref.invalidate(walletProvider);
           ref.invalidate(walletTransactionsProvider);
+          ref.invalidate(withdrawalsProvider);
         },
       ),
       data: (w) {
@@ -34,6 +37,7 @@ class WalletScreen extends ConsumerWidget {
           onRefresh: () async {
             ref.invalidate(walletProvider);
             ref.invalidate(walletTransactionsProvider);
+            ref.invalidate(withdrawalsProvider);
           },
           child: ScreenStaggeredColumn(
             animationKey: 'wallet',
@@ -53,6 +57,12 @@ class WalletScreen extends ConsumerWidget {
               ),
               const SizedBox(height: 16),
               _EarningsOverview(wallet: w),
+              const SizedBox(height: 24),
+              _WithdrawalsSection(
+                withdrawals: withdrawals,
+                expectedDays: w.withdrawal.expectedDays,
+                onRetry: () => ref.invalidate(withdrawalsProvider),
+              ),
               const SizedBox(height: 24),
               _TransactionSection(
                 transactions: transactions,
@@ -93,7 +103,7 @@ class _BalanceCard extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(
-            'Total earned',
+            'Available balance',
             style: GoogleFonts.inter(
               fontSize: 13,
               fontWeight: FontWeight.w500,
@@ -101,12 +111,8 @@ class _BalanceCard extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 10),
-          // Large available balance amount — label reads "Total earned" now,
-          // but this stays bound to availablePaise, not lifetimePaise: with
-          // payouts run manually for now, this is "what's been marked paid
-          // out so far" (moves up from Pending as admin marks withdrawals
-          // paid), not the running lifetime-earnings figure shown in the
-          // Earnings overview tiles below.
+          // What the creator can withdraw right now. Lifetime earnings are
+          // shown separately in the Earnings overview tiles below.
           Text(
             formatPaise(wallet.availablePaise),
             style: GoogleFonts.plusJakartaSans(
@@ -228,7 +234,7 @@ class _BalanceCard extends StatelessWidget {
                           children: [
                             Flexible(
                               child: Text(
-                                'Transfer to bank',
+                                withdrawSubtitle(wallet.withdrawal),
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
                                 style: GoogleFonts.inter(
@@ -361,6 +367,140 @@ class _StatBox extends StatelessWidget {
   }
 }
 
+class _WithdrawalsSection extends StatelessWidget {
+  const _WithdrawalsSection({
+    required this.withdrawals,
+    required this.expectedDays,
+    required this.onRetry,
+  });
+
+  final AsyncValue<List<Withdrawal>> withdrawals;
+  final int expectedDays;
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    final vc = HalchalColors.of(context);
+    return withdrawals.when(
+      skipLoadingOnRefresh: true,
+      loading: () => const SizedBox.shrink(),
+      error: (e, _) => Row(
+        children: [
+          Expanded(
+            child: Text('Could not load withdrawals', style: TextStyle(color: vc.muted)),
+          ),
+          TextButton(onPressed: onRetry, child: const Text('Try again')),
+        ],
+      ),
+      data: (list) {
+        // Nothing requested yet - keep the screen uncluttered.
+        if (list.isEmpty) return const SizedBox.shrink();
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'WITHDRAWALS',
+              style: GoogleFonts.inter(
+                fontSize: 11,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 0.8,
+                color: vc.muted,
+              ),
+            ),
+            const SizedBox(height: 12),
+            ...list.take(10).map((w) => _WithdrawalRow(w: w, expectedDays: expectedDays)),
+          ],
+        );
+      },
+    );
+  }
+}
+
+class _WithdrawalRow extends StatelessWidget {
+  const _WithdrawalRow({required this.w, required this.expectedDays});
+
+  final Withdrawal w;
+  final int expectedDays;
+
+  @override
+  Widget build(BuildContext context) {
+    final vc = HalchalColors.of(context);
+    final (chipColor, chipBg) = switch (w.status) {
+      'completed' => (vc.money, vc.money.withValues(alpha: 0.12)),
+      'failed' => (vc.error, vc.error.withValues(alpha: 0.12)),
+      _ => (vc.primary, vc.primary.withValues(alpha: 0.12)),
+    };
+
+    DateTime? created;
+    try {
+      created = DateTime.parse(w.createdAt).toLocal();
+    } catch (_) {}
+    final dateStr = created != null ? '${created.day} ${_monthName(created.month)} ${created.year}' : w.createdAt;
+
+    final detail = switch (w.status) {
+      'completed' => w.utr != null && w.utr!.isNotEmpty ? 'Reference ${w.utr}' : 'Sent to your account',
+      'failed' => w.failureReason != null && w.failureReason!.isNotEmpty
+          ? '${w.failureReason} - ${formatPaise(w.amountPaise)} returned to your wallet'
+          : '${formatPaise(w.amountPaise)} returned to your wallet',
+      _ => 'Expected within $expectedDays days of your request',
+    };
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 13),
+      decoration: BoxDecoration(
+        color: vc.surface,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: vc.border),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  formatPaise(w.netPaise),
+                  style: GoogleFonts.plusJakartaSans(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w700,
+                    color: vc.onSurface,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  '$dateStr${w.payoutLabel != null ? ' · ${w.payoutLabel}' : ''}${w.payoutMasked != null ? ' ${w.payoutMasked}' : ''}',
+                  style: GoogleFonts.inter(fontSize: 11, color: vc.muted),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  detail,
+                  style: GoogleFonts.inter(fontSize: 12, height: 1.3, color: vc.onSurface.withValues(alpha: 0.7)),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 10),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+            decoration: BoxDecoration(color: chipBg, borderRadius: BorderRadius.circular(20)),
+            child: Text(
+              w.status == 'failed' ? 'Failed' : withdrawalStatusLabel(w.status),
+              style: GoogleFonts.inter(fontSize: 11, fontWeight: FontWeight.w700, color: chipColor),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _monthName(int m) => const [
+        '', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+        'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+      ][m];
+}
+
 class _TransactionSection extends StatelessWidget {
   const _TransactionSection({required this.transactions, required this.onRetry});
 
@@ -428,18 +568,13 @@ class _TransactionRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final vc = HalchalColors.of(context);
-    final isCredit = tx.amountPaise > 0 || tx.type == 'earning';
-    final label = switch (tx.type) {
-      'earning' || 'earning_credit' => 'Campaign earning',
-      'withdrawal' => 'Withdrawal',
-      'refund' => 'Refund',
-      'bonus' => 'Bonus',
-      _ => tx.type,
-    };
+    final presentation = transactionPresentation(tx.type, tx.amountPaise);
+    final isCredit = presentation.isCredit;
+    final label = presentation.label;
     final icon = switch (tx.type) {
       'earning' || 'earning_credit' => Icons.trending_up,
-      'withdrawal' => Icons.arrow_upward,
-      'refund' => Icons.replay,
+      'withdrawal' || 'withdrawal_debit' => Icons.arrow_upward,
+      'withdrawal_refund' || 'refund' => Icons.replay,
       _ => Icons.receipt_outlined,
     };
 
@@ -490,7 +625,11 @@ class _TransactionRow extends StatelessWidget {
                     color: vc.onSurface,
                   ),
                 ),
-                if (tx.note != null && tx.note!.isNotEmpty)
+                // The debit note is an internal ledger line (fee/net in paise);
+                // the Withdrawals section above already shows the details.
+                if (tx.type != 'withdrawal_debit' &&
+                    tx.note != null &&
+                    tx.note!.isNotEmpty)
                   Text(
                     tx.note!,
                     style: GoogleFonts.inter(
@@ -511,7 +650,7 @@ class _TransactionRow extends StatelessWidget {
             ),
           ),
           Text(
-            '${isCredit ? '+' : ''}${formatPaise(tx.amountPaise)}',
+            '${isCredit ? '+' : '-'}${formatPaise(tx.amountPaise.abs())}',
             style: GoogleFonts.plusJakartaSans(
               fontSize: 15,
               fontWeight: FontWeight.w700,

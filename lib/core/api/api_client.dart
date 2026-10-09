@@ -871,7 +871,7 @@ class ApiClient {
         (_) {},
       );
 
-  Future<WithdrawalResult> createWithdrawal({
+  Future<Withdrawal> createWithdrawal({
     required int amountPaise,
     required String payoutMethodId,
     String? idempotencyKey,
@@ -883,7 +883,14 @@ class ApiClient {
           'payoutMethodId': payoutMethodId,
           if (idempotencyKey != null) 'idempotencyKey': idempotencyKey,
         },
-        (d) => WithdrawalResult.fromJson(d as Map<String, dynamic>),
+        (d) => Withdrawal.fromJson(d as Map<String, dynamic>),
+      );
+
+  Future<List<Withdrawal>> fetchWithdrawals() => get(
+        '/withdrawals',
+        (d) => ((d as Map<String, dynamic>)['items'] as List<dynamic>)
+            .map((e) => Withdrawal.fromJson(e as Map<String, dynamic>))
+            .toList(),
       );
 
   Future<SupportTicket> createSupportTicket({
@@ -1128,19 +1135,85 @@ class WalletData {
     required this.pendingPaise,
     required this.lifetimePaise,
     this.clipsUnderReview = 0,
-  });
+    WithdrawalRules? withdrawal,
+  }) : withdrawal = withdrawal ?? WithdrawalRules.unavailable();
 
   final int availablePaise;
   final int pendingPaise;
   final int lifetimePaise;
   final int clipsUnderReview;
 
+  /// The withdrawal rules and this creator's standing against them, straight
+  /// from the server — the app hard-codes none of it.
+  final WithdrawalRules withdrawal;
+
   factory WalletData.fromJson(Map<String, dynamic> json) => WalletData(
         availablePaise: json['availablePaise'] as int? ?? 0,
         pendingPaise: json['pendingPaise'] as int? ?? 0,
         lifetimePaise: json['lifetimePaise'] as int? ?? 0,
         clipsUnderReview: json['clipsUnderReview'] as int? ?? 0,
+        withdrawal: json['withdrawal'] is Map<String, dynamic>
+            ? WithdrawalRules.fromJson(json['withdrawal'] as Map<String, dynamic>)
+            : null,
       );
+}
+
+/// Withdrawal rules from GET /wallet. If the server didn't send them (an older
+/// API), [WithdrawalRules.unavailable] keeps the screen safely locked rather
+/// than guessing amounts or fees.
+class WithdrawalRules {
+  WithdrawalRules({
+    required this.unlocked,
+    required this.lifetimeGatePaise,
+    required this.remainingToUnlockPaise,
+    required this.denominationsPaise,
+    required this.feeBps,
+    required this.hasOpenWithdrawal,
+    required this.requestedToday,
+    this.nextRequestAt,
+    required this.expectedDays,
+  });
+
+  final bool unlocked;
+  final int lifetimeGatePaise;
+  final int remainingToUnlockPaise;
+  final List<int> denominationsPaise;
+  final int feeBps;
+  final bool hasOpenWithdrawal;
+  final bool requestedToday;
+  final String? nextRequestAt;
+  final int expectedDays;
+
+  factory WithdrawalRules.unavailable() => WithdrawalRules(
+        unlocked: false,
+        lifetimeGatePaise: 0,
+        remainingToUnlockPaise: 0,
+        denominationsPaise: const [],
+        feeBps: 0,
+        hasOpenWithdrawal: false,
+        requestedToday: false,
+        expectedDays: 7,
+      );
+
+  factory WithdrawalRules.fromJson(Map<String, dynamic> json) => WithdrawalRules(
+        unlocked: json['unlocked'] as bool? ?? false,
+        lifetimeGatePaise: json['lifetimeGatePaise'] as int? ?? 0,
+        remainingToUnlockPaise: json['remainingToUnlockPaise'] as int? ?? 0,
+        denominationsPaise: (json['denominationsPaise'] as List<dynamic>? ?? const [])
+            .map((e) => e as int)
+            .toList(),
+        feeBps: json['feeBps'] as int? ?? 0,
+        hasOpenWithdrawal: json['hasOpenWithdrawal'] as bool? ?? false,
+        requestedToday: json['requestedToday'] as bool? ?? false,
+        nextRequestAt: json['nextRequestAt'] as String?,
+        expectedDays: json['expectedDays'] as int? ?? 7,
+      );
+
+  /// Fee in paise for a withdrawal of [amountPaise] — same floor rounding as
+  /// the server, so the preview matches what is actually charged.
+  int feeFor(int amountPaise) => (amountPaise * feeBps) ~/ 10000;
+
+  int netFor(int amountPaise) => amountPaise - feeFor(amountPaise);
 }
 
 class TransactionItem {
@@ -1193,15 +1266,49 @@ class PayoutMethod {
       );
 }
 
-class WithdrawalResult {
-  WithdrawalResult({required this.netPaise, required this.feePaise});
-  final int netPaise;
-  final int feePaise;
+/// A creator's withdrawal request. Status: pending (requested), processing
+/// (handed to the accounts team), completed (paid) or failed (refunded).
+class Withdrawal {
+  Withdrawal({
+    required this.id,
+    required this.amountPaise,
+    required this.feePaise,
+    required this.netPaise,
+    required this.status,
+    required this.createdAt,
+    this.processedAt,
+    this.utr,
+    this.failureReason,
+    this.payoutLabel,
+    this.payoutMasked,
+  });
 
-  factory WithdrawalResult.fromJson(Map<String, dynamic> json) =>
-      WithdrawalResult(
-        netPaise: json['netPaise'] as int,
+  final String id;
+  final int amountPaise;
+  final int feePaise;
+  final int netPaise;
+  final String status;
+  final String createdAt;
+  final String? processedAt;
+  final String? utr;
+  final String? failureReason;
+  final String? payoutLabel;
+  final String? payoutMasked;
+
+  bool get isOpen => status == 'pending' || status == 'processing';
+
+  factory Withdrawal.fromJson(Map<String, dynamic> json) => Withdrawal(
+        id: json['id'] as String,
+        amountPaise: json['amountPaise'] as int,
         feePaise: json['feePaise'] as int,
+        netPaise: json['netPaise'] as int,
+        status: json['status'] as String? ?? 'pending',
+        createdAt: json['createdAt'] as String,
+        processedAt: json['processedAt'] as String?,
+        utr: json['utr'] as String?,
+        failureReason: json['failureReason'] as String?,
+        payoutLabel: json['payoutLabel'] as String?,
+        payoutMasked: json['payoutMasked'] as String?,
       );
 }
 

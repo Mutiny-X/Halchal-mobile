@@ -17,3 +17,8 @@ final walletTransactionsProvider = FutureProvider<List<TransactionItem>>((ref) a
   watchAppRealtimeTick(ref);
   return ref.read(apiClientProvider).fetchTransactions();
 });
+
+final withdrawalsProvider = FutureProvider<List<Withdrawal>>((ref) async {
+  watchAppRealtimeTick(ref);
+  return ref.read(apiClientProvider).fetchWithdrawals();
+});
