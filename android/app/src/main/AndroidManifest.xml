@@ -20,6 +20,7 @@
         android:label="Halchal"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false"
         android:requestLegacyExternalStorage="true"
         android:enableOnBackInvokedCallback="true">
         <!-- Without an explicit default channel, background/killed-state FCM
