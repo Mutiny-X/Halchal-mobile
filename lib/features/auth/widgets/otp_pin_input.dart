@@ -28,6 +28,8 @@ class OtpPinInputState extends State<OtpPinInput> {
   final _nodes = List.generate(_length, (_) => FocusNode());
   final _controllers = List.generate(_length, (_) => TextEditingController());
 
+  final _previous = List.filled(_length, '');
+
   @override
   void dispose() {
     for (final n in _nodes) {
@@ -43,6 +45,7 @@ class OtpPinInputState extends State<OtpPinInput> {
     for (final c in _controllers) {
       c.clear();
     }
+    _previous.fillRange(0, _length, '');
     if (mounted) setState(() {});
     _nodes.first.requestFocus();
   }
@@ -57,13 +60,18 @@ class OtpPinInputState extends State<OtpPinInput> {
   }
 
   void _onChanged(int index, String value) {
-    final digit = value.replaceAll(RegExp(r'\D'), '');
-    if (digit.length > 1) {
-      _controllers[index].text = digit[digit.length - 1];
-      _controllers[index].selection = const TextSelection.collapsed(offset: 1);
-    } else {
-      _controllers[index].text = digit;
+    var digit = value.replaceAll(RegExp(r'\D'), '');
+    final hadDigit = _previous[index].isNotEmpty;
+    // Typing over a filled box gives 2 chars: keep the new one. Anything longer
+    // (or 2 chars into an empty box) is a paste / SMS autofill: spread it.
+    if (digit.length > 2 || (digit.length == 2 && !hadDigit)) {
+      _spread(index, digit);
+      return;
     }
+    if (digit.length > 1) digit = digit[digit.length - 1];
+    _controllers[index].text = digit;
+    _controllers[index].selection = TextSelection.collapsed(offset: digit.length);
+    _previous[index] = digit;
 
     if (digit.isNotEmpty && index < _length - 1) {
       _nodes[index + 1].requestFocus();
@@ -72,6 +80,24 @@ class OtpPinInputState extends State<OtpPinInput> {
       _nodes[index - 1].requestFocus();
     }
 
+    setState(() {});
+    _notifyIfComplete();
+  }
+
+  /// Fills the boxes with a pasted code. A full-length code always starts at the
+  /// first box; a shorter one starts at the box it was pasted into.
+  void _spread(int index, String digits) {
+    final start = digits.length >= _length ? 0 : index;
+    final chars = digits.length > _length ? digits.substring(0, _length) : digits;
+    for (var i = 0; i < _length; i++) {
+      final pos = i - start;
+      if (pos >= 0 && pos < chars.length) {
+        _controllers[i].text = chars[pos];
+        _previous[i] = chars[pos];
+      }
+    }
+    final last = (start + chars.length - 1).clamp(0, _length - 1);
+    _nodes[last].requestFocus();
     setState(() {});
     _notifyIfComplete();
   }
@@ -122,7 +148,8 @@ class OtpPinInputState extends State<OtpPinInput> {
                 autofocus: i == 0,
                 textAlign: TextAlign.center,
                 keyboardType: TextInputType.number,
-                maxLength: 1,
+                // No maxLength: it would cut a pasted code down to one digit
+                // before onChanged sees it. _onChanged keeps each box to one.
                 style: AuthUi.bodyFont(context).copyWith(
                   fontSize: 22,
                   fontWeight: FontWeight.w700,
